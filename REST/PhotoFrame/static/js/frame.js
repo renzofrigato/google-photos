@@ -149,6 +149,15 @@ $(document).ready(() => {
   $('#startSlideshow')
       .on('click', (e) => $('#images-container a').first().click());
 
+  $('#saveCached')
+      .on('click', (e) => $.ajax({
+        type: 'POST',
+        url: '/saveCached',
+        dataType: 'json',
+        success: (data) => {},
+        error: (data) => {}
+      }));
+
   // Clicking log out opens the log out screen.
   $('#logout').on('click', (e) => {
     window.location = '/logout';

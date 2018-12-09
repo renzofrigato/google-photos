@@ -28,10 +28,15 @@ const session = require('express-session');
 const sessionFileStore = require('session-file-store');
 const uuid = require('uuid');
 const winston = require('winston');
+const fs = require('fs');
+const https = require('https');
 
 const app = express();
 const fileStore = sessionFileStore(session);
 const server = http.Server(app);
+const Q = require('q');
+
+const Stream = require('stream').Transform;
 
 // Use the EJS template engine
 app.set('view engine', 'ejs');
@@ -66,6 +71,13 @@ const albumCache = persist.create({
   ttl: 600000,  // 10 minutes
 });
 albumCache.init();
+
+
+const sharedAlbumCache = persist.create({
+  dir: 'persist-sharedalbumcache/',
+  ttl: 600000,  // 10 minutes
+});
+sharedAlbumCache.init();
 
 // For each user, the app stores the last search parameters or album
 // they loaded into the photo frame. The next time they log in
@@ -218,6 +230,10 @@ app.get('/album', (req, res) => {
   renderIfAuthenticated(req, res, 'pages/album');
 });
 
+app.get('/sharedalbum', (req, res) => {
+  renderIfAuthenticated(req, res, 'pages/sharedalbum');
+});
+
 
 // Handles form submissions from the search page.
 // The user has made a selection and wants to load photos into the photo frame
@@ -333,6 +349,38 @@ app.get('/getAlbums', async (req, res) => {
 });
 
 
+app.get('/getSharedAlbums', async (req, res) => {
+  logger.info('Loading shared albums');
+  const userId = req.user.profile.id;
+
+  // Attempt to load the albums from cache if available.
+  // Temporarily caching the albums makes the app more responsive.
+  const cachedSharedAlbums = await sharedAlbumCache.getItem(userId);
+  if (cachedSharedAlbums) {
+    logger.verbose('Loaded albums from cache.');
+    res.status(200).send(cachedAlbums);
+  } else {
+    logger.verbose('Loading albums from API.');
+    // Albums not in cache, retrieve the albums from the Library API
+    // and return them
+    const data = await libraryApiGetAlbums(req.user.token, true);
+    if (data.error) {
+      // Error occured during the request. Albums could not be loaded.
+      returnError(res, data);
+      // Clear the cached albums.
+      albumCache.removeItem(userId);
+    } else {
+      // Albums were successfully loaded from the API. Cache them
+      // temporarily to speed up the next request and return them.
+      // The cache implementation automatically clears the data when the TTL is
+      // reached.
+      res.status(200).send(data);
+      albumCache.setItemSync(userId, data);
+    }
+  }
+});
+
+
 // Returns a list of the media items that the user has selected to
 // be shown on the photo frame.
 // If the media items are still in the temporary cache, they are directly
@@ -370,6 +418,17 @@ app.get('/getQueue', async (req, res) => {
     logger.verbose('No cached data.')
     res.status(200).send({});
   }
+});
+
+app.post('/saveCached', async (req, res) => {
+  const userId = req.user.profile.id;
+  const cachedPhotos = await mediaItemCache.getItem(userId);
+  const stored = await storage.getItem(userId);
+  const albumId = stored.parameters.albumId;
+  if (cachedPhotos) {
+    saveCachedPhotos(cachedPhotos, albumId);
+  }
+  res.status(200).send({});
 });
 
 
@@ -418,6 +477,68 @@ function returnPhotos(res, userId, data, searchParameter) {
   }
 }
 
+function saveCachedPhotos(photos, albumId) {
+  const nq = config.numQueues || 1;
+  logger.info(`numQueues: ${nq}`);
+  for (var j = 0; j < nq; j++) {
+    recurseSavePhoto(photos, j, nq, albumId)
+    // photos.reduce((cur, prev) => cur.then((i) => savePhoto(photos[i], i, nq, len)), savePhoto(photos[j], j, nq, len));
+  }
+}
+
+function recurseSavePhoto(photos, i, numQueues, albumId) {
+  savePhoto(photos[i], i, numQueues, albumId).then(
+    (j) =>{
+      if (j < photos.length) {
+        recurseSavePhoto(photos, j, numQueues, albumId);
+      } else {
+        return;
+      }
+    })
+}
+function requestPhoto(url, path, i, numQueues, deferred) {
+  https.request(url, function(response) {
+    var data = new Stream();
+
+    response.on('data', function(chunk) {
+      data.push(chunk);
+    });
+
+    response.on('error', function (err){
+      logger.error(err);
+      deferred.reject(new Error(err));
+    })
+
+    response.on('end', function() {
+      logger.info(`Saving photo ${i} to ${path}`);
+      fs.writeFile(path, data.read(), function(err) {
+        if (err) {
+          logger.error(err)
+          deferred.reject(new Error(err));
+        } else {
+          logger.info(`Saved photo ${i} to ${path}`);
+          deferred.resolve(i + numQueues);
+        }
+      });
+    });
+  }).end();
+}
+
+function savePhoto(photo, i, numQueues, albumId) {
+  const path = config.savePath + albumId + '/' + photo.filename;
+  const width = photo.mediaMetadata.width;
+  const height = photo.mediaMetadata.height;
+  const url = `${photo.baseUrl}=w256-h256`;
+
+  const deferred = Q.defer()
+  fs.mkdir(config.savePath + albumId, function(err){
+    if (err) {
+       if (err.code == 'EEXIST') requestPhoto(url, path, i, numQueues, deferred)
+       else throw(err);
+    } else requestPhoto(url, path, i, numQueues, deferred);
+  })
+  return deferred.promise;
+}
 // Responds with an error status code and the encapsulated data.error.
 function returnError(res, data) {
   // Return the same status code that was returned in the error or use 500
@@ -509,7 +630,8 @@ async function libraryApiSearch(authToken, parameters) {
 
 // Returns a list of all albums owner by the logged in user from the Library
 // API.
-async function libraryApiGetAlbums(authToken) {
+async function libraryApiGetAlbums(authToken, shared) {
+  let urlPath = shared ? '/v1/sharedAlbums' : '/v1/albums';
   let albums = [];
   let nextPageToken = null;
   let error = null;
@@ -522,7 +644,7 @@ async function libraryApiGetAlbums(authToken) {
       logger.verbose(`Loading albums. Received so far: ${albums.length}`);
       // Make a GET request to load the albums with optional parameters (the
       // pageToken if set).
-      const result = await request.get(config.apiEndpoint + '/v1/albums', {
+      const result = await request.get(config.apiEndpoint + urlPath, {
         headers: {'Content-Type': 'application/json'},
         qs: parameters,
         json: true,
@@ -530,7 +652,9 @@ async function libraryApiGetAlbums(authToken) {
       });
 
       logger.debug(`Response: ${result}`);
-
+      if (result && result.sharedAlbums) {
+        result.albums = result.sharedAlbums;
+      }
       if (result && result.albums) {
         logger.verbose(`Number of albums received: ${result.albums.length}`);
         // Parse albums and add them to the list, skipping empty entries.

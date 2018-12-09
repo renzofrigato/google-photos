@@ -14,6 +14,7 @@
     "node": ">=7.8.0"
   },
   "dependencies": {
+    "q": "^1.5.1",
     "@fancyapps/fancybox": "^3.5.2",
     "async": "^2.6.1",
     "body-parser": "^1.18.3",
