@@ -299,6 +299,7 @@ app.post('/loadFromSearch', async (req, res) => {
 // Returns a list of photos if this was successful, or an error otherwise.
 app.post('/loadFromAlbum', async (req, res) => {
   const albumId = req.body.albumId;
+  const albumTitle = req.body.albumTitle;
   const userId = req.user.profile.id;
   const authToken = req.user.token;
 
@@ -308,7 +309,7 @@ app.post('/loadFromAlbum', async (req, res) => {
   // where the only parameter is the album ID.
   // Note that no other filters can be set, so this search will
   // also return videos that are otherwise filtered out in libraryApiSearch(..).
-  const parameters = {albumId};
+  const parameters = {albumId, albumTitle};
 
   // Submit the search request to the API and wait for the result.
   const data = await libraryApiSearch(authToken, parameters);
@@ -358,7 +359,7 @@ app.get('/getSharedAlbums', async (req, res) => {
   const cachedSharedAlbums = await sharedAlbumCache.getItem(userId);
   if (cachedSharedAlbums) {
     logger.verbose('Loaded albums from cache.');
-    res.status(200).send(cachedAlbums);
+    res.status(200).send(cachedSharedAlbums);
   } else {
     logger.verbose('Loading albums from API.');
     // Albums not in cache, retrieve the albums from the Library API
@@ -368,14 +369,14 @@ app.get('/getSharedAlbums', async (req, res) => {
       // Error occured during the request. Albums could not be loaded.
       returnError(res, data);
       // Clear the cached albums.
-      albumCache.removeItem(userId);
+      sharedAlbumCache.removeItem(userId);
     } else {
       // Albums were successfully loaded from the API. Cache them
       // temporarily to speed up the next request and return them.
       // The cache implementation automatically clears the data when the TTL is
       // reached.
       res.status(200).send(data);
-      albumCache.setItemSync(userId, data);
+      sharedAlbumCache.setItemSync(userId, data);
     }
   }
 });
@@ -424,9 +425,9 @@ app.post('/saveCached', async (req, res) => {
   const userId = req.user.profile.id;
   const cachedPhotos = await mediaItemCache.getItem(userId);
   const stored = await storage.getItem(userId);
-  const albumId = stored.parameters.albumId;
+  const albumTitle = stored.parameters.albumTitle;
   if (cachedPhotos) {
-    saveCachedPhotos(cachedPhotos, albumId);
+    saveCachedPhotos(cachedPhotos, albumTitle);
   }
   res.status(200).send({});
 });
@@ -477,20 +478,20 @@ function returnPhotos(res, userId, data, searchParameter) {
   }
 }
 
-function saveCachedPhotos(photos, albumId) {
+function saveCachedPhotos(photos, albumTitle) {
   const nq = config.numQueues || 1;
   logger.info(`numQueues: ${nq}`);
   for (var j = 0; j < nq; j++) {
-    recurseSavePhoto(photos, j, nq, albumId)
+    recurseSavePhoto(photos, j, nq, albumTitle)
     // photos.reduce((cur, prev) => cur.then((i) => savePhoto(photos[i], i, nq, len)), savePhoto(photos[j], j, nq, len));
   }
 }
 
-function recurseSavePhoto(photos, i, numQueues, albumId) {
-  savePhoto(photos[i], i, numQueues, albumId).then(
+function recurseSavePhoto(photos, i, numQueues, albumTitle) {
+  savePhoto(photos[i], i, numQueues, albumTitle).then(
     (j) =>{
       if (j < photos.length) {
-        recurseSavePhoto(photos, j, numQueues, albumId);
+        recurseSavePhoto(photos, j, numQueues, albumTitle);
       } else {
         return;
       }
@@ -571,6 +572,8 @@ async function libraryApiSearch(authToken, parameters) {
   let error = null;
 
   parameters.pageSize = config.searchPageSize;
+  let albumTitle = parameters.albumTitle;
+  delete parameters.albumTitle;
 
   try {
     // Loop while the number of photos threshold has not been met yet
@@ -606,6 +609,8 @@ async function libraryApiSearch(authToken, parameters) {
       // Set the pageToken for the next request.
       parameters.pageToken = result.nextPageToken;
 
+
+
       logger.verbose(
           `Found ${items.length} images in this request. Total images: ${
               photos.length}`);
@@ -623,6 +628,7 @@ async function libraryApiSearch(authToken, parameters) {
         {name: err.name, code: err.statusCode, message: err.message};
     logger.error(error);
   }
+  parameters.albumTitle = albumTitle;
 
   logger.info('Search complete.');
   return {photos, parameters, error};

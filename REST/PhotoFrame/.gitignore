@@ -4,4 +4,5 @@ sessions/
 persist-storage/
 persist-mediaitemcache/
 persist-albumcache/
+persist-sharedalbumcache/
 .DS_STORE
